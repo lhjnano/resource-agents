@@ -26,11 +26,13 @@ OCF_RESKEY_pool_default=""
 OCF_RESKEY_importargs_default=""
 OCF_RESKEY_importforce_default=true
 OCF_RESKEY_settle_timeout_default="10"
+OCF_RESKEY_monitor_settle_ms_default="500"
 
 : ${OCF_RESKEY_pool=${OCF_RESKEY_pool_default}}
 : ${OCF_RESKEY_importargs=${OCF_RESKEY_importargs_default}}
 : ${OCF_RESKEY_importforce=${OCF_RESKEY_importforce_default}}
 : ${OCF_RESKEY_settle_timeout=${OCF_RESKEY_settle_timeout_default}}
+: ${OCF_RESKEY_monitor_settle_ms=${OCF_RESKEY_monitor_settle_ms_default}}
 
 # Root of the ZFS kstat tree. Not an OCF parameter: it exists so the agent can
 # be driven against a fake tree by tests, which is the only way to exercise the
@@ -94,6 +96,23 @@ the common case - costs nothing. Set to 0 to disable it.
 </longdesc>
 <shortdesc lang="en">Seconds start waits for the state to settle</shortdesc>
 <content type="integer" default="${OCF_RESKEY_settle_timeout_default}" />
+</parameter>
+<parameter name="monitor_settle_ms" unique="0" required="0">
+<longdesc lang="en">
+Milliseconds the recurring monitor may spend re-reading an unexpected pool
+state before reporting it.
+
+The same oscillation can be sampled by a monitor rather than by start - after
+an import this agent performed, or one it did not, such as a probe racing a
+manual import. The monitor re-reads for at most this long and reports whatever
+the pool settles on.
+
+This is deliberately far smaller than settle_timeout: the monitor only has to
+outlast a burst, and every millisecond here delays the detection of a pool
+that is genuinely offline. Set to 0 to report the first reading, as before.
+</longdesc>
+<shortdesc lang="en">Milliseconds the monitor re-reads</shortdesc>
+<content type="integer" default="${OCF_RESKEY_monitor_settle_ms_default}" />
 </parameter>
 </parameters>
 
@@ -305,9 +324,34 @@ zpool_monitor () {
 	HEALTH=$(zpool_read_health)
 
 	case "$HEALTH" in
+		ONLINE|DEGRADED|FAULTED)
+			;;
+		*)
+			# Not necessarily a broken pool: the kstat is a lock-free
+			# snapshot and can be read mid-transition, or come back
+			# empty if the read raced an export. Re-read before
+			# deciding; one that is really broken stays broken.
+			if zpool_kstat_state_exists; then k=present; else k=absent; fi
+			ocf_log info "$OCF_RESKEY_pool: '$HEALTH' (kstat=$k), re-reading"
+
+			if [ "$OCF_RESKEY_monitor_settle_ms" -gt 0 ]; then
+				budget=$(( $(zpool_clamp_budget_s 1) * 1000 ))
+				if [ "$budget" -gt "$OCF_RESKEY_monitor_settle_ms" ]; then
+					budget=$OCF_RESKEY_monitor_settle_ms
+				fi
+				HEALTH=$(zpool_stable_health 2 100 "$budget")
+				ocf_log info "$OCF_RESKEY_pool: settled on '$HEALTH'"
+			fi
+			;;
+	esac
+
+	case "$HEALTH" in
 		ONLINE|DEGRADED) return $OCF_SUCCESS;;
 		FAULTED)         return $OCF_NOT_RUNNING;;
-		*)               return $OCF_ERR_GENERIC;;
+		*)
+			ocf_log err "$OCF_RESKEY_pool: failing on '$HEALTH'"
+			return $OCF_ERR_GENERIC
+			;;
 	esac
 }
 
@@ -320,6 +364,12 @@ zpool_validate () {
 
 	if ! ocf_is_decimal "$OCF_RESKEY_settle_timeout"; then
 		ocf_exit_reason "Invalid settle_timeout='${OCF_RESKEY_settle_timeout}': expected a non-negative integer"
+		return $OCF_ERR_CONFIGURED
+	fi
+
+	if ! ocf_is_decimal "$OCF_RESKEY_monitor_settle_ms"; then
+		ocf_exit_reason \
+			"monitor_settle_ms='$OCF_RESKEY_monitor_settle_ms' is not a number"
 		return $OCF_ERR_CONFIGURED
 	fi
 
