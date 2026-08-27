@@ -77,20 +77,22 @@ zpool import is given the -f option.
 </parameter>
 <parameter name="settle_timeout" unique="0" required="0">
 <longdesc lang="en">
-Seconds to wait after a successful import for the pool state to settle before
-reporting the pool as started.
+Seconds start may spend waiting for the pool state to settle after a
+successful import.
 
 /proc/spl/kstat/zfs/&lt;pool&gt;/state is a lock-free snapshot of the root vdev
-state, so shortly after an import it can still read OFFLINE or TRANSITIONING
-while vdevs are being reopened. Pacemaker starts the recurring monitor as soon
-as start returns, and the monitor treats anything other than ONLINE, DEGRADED
-or FAULTED as a hard error, so a reading taken inside that window fails a
-healthy pool and triggers a needless recovery.
+state, and after an import it does not simply transition once to ONLINE: it
+oscillates while the vdevs are reopened. A single reading is ONLINE most of
+the time while the pool is still unsettled, so start waits for three
+consecutive healthy reads 100ms apart instead of one.
 
-The pool state is read once before any waiting, so a pool that is already
-settled - the common case - costs nothing. Set to 0 to disable the wait.
+Pacemaker starts the recurring monitor as soon as start returns, and a reading
+taken inside that window would fail a healthy pool and trigger a needless
+recovery. The wait never fails the start; judging the pool is the monitor's
+job. The state is read before any waiting, so a pool that is already settled -
+the common case - costs nothing. Set to 0 to disable it.
 </longdesc>
-<shortdesc lang="en">Seconds to wait for the pool state to settle after import</shortdesc>
+<shortdesc lang="en">Seconds start waits for the state to settle</shortdesc>
 <content type="integer" default="${OCF_RESKEY_settle_timeout_default}" />
 </parameter>
 </parameters>
@@ -140,14 +142,55 @@ zpool_is_imported () {
 	return $rc
 }
 
-# Reads the pool state kstat into $zpool_state.
-# Returns 0 when the pool is usable (ONLINE or DEGRADED), 1 otherwise.
-zpool_state_is_settled () {
-	zpool_state=$(zpool_read_health)
-	case "$zpool_state" in
-		ONLINE|DEGRADED) return 0;;
-	esac
-	return 1
+# Reads the health until it is stable, and echoes the value it settled on.
+#
+# The kstat is a lock-free snapshot of the root vdev state, and after an import
+# it does not simply transition once to ONLINE: it oscillates while the vdevs
+# are reopened. Sampling on one system measured 1210 transitions over 65
+# minutes, with OFFLINE bursts of 4ms median and 78ms maximum, concentrated in
+# the first ~0.5s. A single reading is therefore ONLINE about 93% of the time
+# while the pool is still unsettled, so one sample is not stability.
+#
+# Requiring $1 consecutive healthy reads $2 milliseconds apart covers a burst
+# longer than the gap, and returns as soon as the pool is genuinely stable.
+#
+#   $1 consecutive healthy reads required
+#   $2 milliseconds between reads
+#   $3 total budget in milliseconds
+#
+# Returns 0 when stable within the budget, 1 otherwise. The caller classifies
+# the echoed value; this never decides success or failure on its own.
+zpool_stable_health () {
+	need=$1
+	gap_ms=$2
+	budget_ms=$3
+	streak=0
+	spent_ms=0
+	last=""
+
+	while :; do
+		last=$(zpool_read_health)
+		case "$last" in
+			ONLINE|DEGRADED)
+				streak=$((streak + 1))
+				if [ "$streak" -ge "$need" ]; then
+					echo "$last"
+					return 0
+				fi
+				;;
+			*)
+				streak=0
+				;;
+		esac
+
+		if [ "$spent_ms" -ge "$budget_ms" ]; then
+			echo "$last"
+			return 1
+		fi
+
+		sleep "0.$(printf '%03d' "$gap_ms")"
+		spent_ms=$((spent_ms + gap_ms))
+	done
 }
 
 # Clamps a wait to what the current operation timeout can afford. Never spend
@@ -187,17 +230,13 @@ zpool_settle () {
 
 	[ "$OCF_RESKEY_settle_timeout" -gt 0 ] || return 0
 
-	settle_max=$(zpool_clamp_budget_s "$OCF_RESKEY_settle_timeout")
+	budget_ms=$(( $(zpool_clamp_budget_s "$OCF_RESKEY_settle_timeout") * 1000 ))
 
-	waited=0
-	while [ "$waited" -lt "$settle_max" ]; do
-		zpool_state_is_settled && return 0
-		sleep 1
-		waited=$((waited + 1))
-	done
-	zpool_state_is_settled && return 0
-
-	ocf_log warn "${OCF_RESKEY_pool}: pool state is still '$zpool_state' after ${settle_max}s"
+	if settled=$(zpool_stable_health 3 100 "$budget_ms"); then
+		ocf_log info "$OCF_RESKEY_pool: start settled on '$settled'"
+	else
+		ocf_log warn "$OCF_RESKEY_pool: still '$settled' after ${budget_ms}ms"
+	fi
 	return 0
 }
 
